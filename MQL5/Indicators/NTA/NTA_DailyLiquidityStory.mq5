@@ -123,6 +123,9 @@ input int      InpPanelWidth      = 330;
 input string   InpPanelFont       = "Consolas";
 input int      InpPanelFontSize   = 8;
 input int      InpLabelFontSize   = 7;
+input ENUM_DLS_LABEL_MODE InpLabelMode = DLS_LABELS_COMPACT; // Chart label detail
+input int      InpLabelDays       = 1;         // Days (newest first) with text labels
+input bool     InpAvoidOverlap    = true;      // Stack colliding labels (re-laid out on zoom/scroll)
 
 input group "=== Colors ==="
 input color    InpAsiaBox         = C'32,42,72';
@@ -253,6 +256,9 @@ int OnInit()
    st.showPath = InpShowPath;        st.showNormalFvg = InpShowNormalFvg;
    st.showPdLevels = InpShowPdLevels; st.showSwingTargets = InpShowSwingTargets;
    st.normalFvgBars = InpNormalFvgBars;
+   st.labelMode = InpLabelMode;
+   st.labelDays = MathMax(0, InpLabelDays);
+   st.avoidOverlap = InpAvoidOverlap;
    g_draw.Init(st, 0);
 
    SetIndexBuffer(0, BufState,  INDICATOR_DATA);
@@ -297,6 +303,23 @@ double RefAtr(const datetime t)
    if(CopyBuffer(g_refAtrHandle, 0, sh + 1, 1, b) == 1 && b[0] != EMPTY_VALUE)
       g_refVal = b[0];
    return g_refVal;
+  }
+
+//+------------------------------------------------------------------+
+bool WithLabels(const int dayIdx)
+  {
+   return dayIdx >= g_eng.dayCount - InpLabelDays;
+  }
+
+//+------------------------------------------------------------------+
+//| Zoom / scroll changes pixel distances: lay the labels out again   |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+  {
+   if(id != CHARTEVENT_CHART_CHANGE || !g_built || !InpAvoidOverlap)
+      return;
+   g_draw.Layout();
+   ChartRedraw();
   }
 
 //+------------------------------------------------------------------+
@@ -387,7 +410,7 @@ int OnCalculate(const int rates_total,
      {
       int first = MathMax(0, g_eng.dayCount - InpDrawDays);
       for(int d = first; d < g_eng.dayCount; d++)
-         g_draw.DrawDay(g_eng, d);
+         g_draw.DrawDay(g_eng, d, WithLabels(d));
       RefreshStats();
       g_built = true;
       g_eng.journal = InpJournal;
@@ -397,18 +420,19 @@ int OnCalculate(const int rates_total,
       if(g_eng.dayCount != daysBefore)
         {
          // new story day: finish the previous one, drop days leaving the window
-         if(daysBefore > 0)
-            g_draw.DrawDay(g_eng, daysBefore - 1);
-         int old = g_eng.dayCount - 1 - InpDrawDays;
-         if(old >= 0)
-            ObjectsDeleteAll(0, g_draw.Prefix() + IntegerToString(g_eng.days[old].dayKey) + "_");
+         int firstDrawn = MathMax(0, g_eng.dayCount - InpDrawDays);
+         for(int d = MathMax(firstDrawn, MathMin(daysBefore - 1, daysBefore - InpLabelDays)); d < g_eng.dayCount - 1; d++)
+            g_draw.DrawDay(g_eng, d, WithLabels(d));   // labels move to the newest days
+         for(int d = MathMax(0, daysBefore - InpDrawDays); d < firstDrawn; d++)
+            g_draw.DeleteDay(g_eng.days[d].dayKey);
          RefreshStats();
         }
-      g_draw.DrawDay(g_eng, g_eng.dayCount - 1);
+      g_draw.DrawDay(g_eng, g_eng.dayCount - 1, WithLabels(g_eng.dayCount - 1));
      }
 
    if(full || processed)
      {
+      g_draw.Layout();
       g_draw.DrawPanel(g_eng, g_statLines);
       ChartRedraw();
      }

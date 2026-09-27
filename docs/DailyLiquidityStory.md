@@ -122,6 +122,16 @@ Logic không thay đổi, hiệu quả phải được backtest.
 - Story path (đường chấm): Asia → London sweep → London extreme → NY sweep → displacement → MSS → FVG → retrace.
 - Panel timeline (mục 21 của spec) + khối thống kê.
 
+### Nhãn rõ ràng, tránh chồng lên nhau
+
+| Input | Mặc định | Ý nghĩa |
+|---|---|---|
+| `InpLabelMode` | `COMPACT` | `FULL`: mọi sự kiện có chữ. `COMPACT`: sự kiện sweep/reclaim/break của level chỉ còn chấm đánh dấu, trạng thái nằm trong nhãn của level (vd. `ASIA BSL 84567.12 [SWEPT LONDON]`), chữ ngắn (`DISP ↓`, `NO REVERSAL (NO MSS)`). `MINIMAL`: chỉ box, level Asia/London và chuỗi NY đã xác nhận. |
+| `InpLabelDays` | `1` | Chỉ các ngày mới nhất có nhãn chữ; ngày cũ chỉ còn box, đường level và tên box. |
+| `InpAvoidOverlap` | `true` | Sắp xếp nhãn theo pixel: nhãn ưu tiên cao (chuỗi NY → tên box → NY target → level → sự kiện phụ) đặt trước, nhãn va chạm được đẩy lên/xuống từng dòng; nhãn phụ không còn chỗ sẽ bị ẩn. Tự sắp xếp lại khi zoom / cuộn chart. |
+
+Nhãn của level đặt ở **cuối đường** (nơi level bị lấy hoặc đang còn mở), tách khỏi tên box Asia/London ở đầu.
+
 ## Buffers (cho EA qua `iCustom`)
 
 | # | Buffer | Ý nghĩa |

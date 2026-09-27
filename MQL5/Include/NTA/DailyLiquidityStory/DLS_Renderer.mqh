@@ -7,6 +7,21 @@
 
 #include "DLS_Engine.mqh"
 
+//--- how much text is drawn on the chart
+enum ENUM_DLS_LABEL_MODE
+  {
+   DLS_LABELS_FULL = 0,     // Full: every event gets a text label
+   DLS_LABELS_COMPACT,      // Compact: level events become markers, short texts
+   DLS_LABELS_MINIMAL       // Minimal: boxes, Asia/London levels and the NY story only
+  };
+
+//--- label priorities: higher is placed first and never hidden
+#define DLS_PRIO_STORY  100
+#define DLS_PRIO_BOX     70
+#define DLS_PRIO_TARGET  55
+#define DLS_PRIO_LEVEL   50
+#define DLS_PRIO_EVENT   30
+
 struct SDlsStyle
   {
    color             asiaBox, londonBox;
@@ -22,6 +37,9 @@ struct SDlsStyle
    int               panelX, panelY, panelWidth;
    bool              showPanel, showStats, showLabels, showPath, showNormalFvg, showPdLevels, showSwingTargets;
    int               normalFvgBars;
+   int               labelMode;        // ENUM_DLS_LABEL_MODE
+   int               labelDays;        // days (from the newest) that get text labels
+   bool              avoidOverlap;     // pixel layout pass that stacks colliding labels
   };
 
 class CDlsRenderer
@@ -32,22 +50,153 @@ private:
    SDlsStyle         st;
    string            m_txt[];
    color             m_clr[];
+   bool              m_dayLabels;      // text labels enabled for the day being drawn
+   // label registry: labels are laid out together so they can avoid each other
+   string            m_lName[];
+   datetime          m_lTime[];
+   double            m_lPrice[];
+   string            m_lText[];
+   color             m_lClr[];
+   int               m_lAnchor[];
+   int               m_lPrio[];
+   int               m_lN;
 
 public:
-                     CDlsRenderer(void) { m_pfx = "NTA_DLS_"; m_chart = 0; }
+                     CDlsRenderer(void) { m_pfx = "NTA_DLS_"; m_chart = 0; m_lN = 0; m_dayLabels = true; }
    void              Init(const SDlsStyle &style, const long chart_id = 0) { st = style; m_chart = chart_id; }
    string            Prefix(void) const { return m_pfx; }
-   void              DeleteAll(void) { ObjectsDeleteAll(m_chart, m_pfx); }
+   void              DeleteAll(void)
+     {
+      ObjectsDeleteAll(m_chart, m_pfx);
+      m_lN = 0;
+      ArrayResize(m_lName, 0); ArrayResize(m_lTime, 0); ArrayResize(m_lPrice, 0);
+      ArrayResize(m_lText, 0); ArrayResize(m_lClr, 0); ArrayResize(m_lAnchor, 0); ArrayResize(m_lPrio, 0);
+     }
+
+   //--- remove every object of a story day (day left the drawing window)
+   void              DeleteDay(const int dayKey)
+     {
+      string p = m_pfx + IntegerToString(dayKey) + "_";
+      ClearLabels(p);
+      ObjectsDeleteAll(m_chart, p);
+     }
+
+   //+---------------------------------------------------------------+
+   //| Label layout: place labels by priority, stack colliding ones   |
+   //| vertically in pixel space. Call after drawing and whenever the |
+   //| chart is scrolled / zoomed (CHARTEVENT_CHART_CHANGE).          |
+   //+---------------------------------------------------------------+
+   void              Layout(void)
+     {
+      int W = (int)ChartGetInteger(m_chart, CHART_WIDTH_IN_PIXELS);
+      int H = (int)ChartGetInteger(m_chart, CHART_HEIGHT_IN_PIXELS, 0);
+      int lh = (int)MathRound(st.labelFontSize * 1.9) + 1;
+      // order by priority, highest first (stable insertion sort)
+      int ord[];
+      ArrayResize(ord, m_lN);
+      int n = m_lN;
+      for(int j = 0; j < n; j++)
+        {
+         int q = j;
+         while(q > 0 && m_lPrio[ord[q - 1]] < m_lPrio[j])
+           {
+            ord[q] = ord[q - 1];
+            q--;
+           }
+         ord[q] = j;
+        }
+      int rx1[], ry1[], rx2[], ry2[];
+      ArrayResize(rx1, m_lN); ArrayResize(ry1, m_lN); ArrayResize(rx2, m_lN); ArrayResize(ry2, m_lN);
+      int placed = 0;
+
+      for(int o = 0; o < n; o++)
+        {
+         int j = ord[o];
+         double price = m_lPrice[j];
+         bool visible = true;
+         int x = 0, y = 0;
+         bool onChart = st.avoidOverlap && W > 0 && H > 0 &&
+                        ChartTimePriceToXY(m_chart, 0, m_lTime[j], price, x, y) &&
+                        x > -600 && x < W + 600 && y > -60 && y < H + 60;
+         if(onChart)
+           {
+            int w = (int)(StringLen(m_lText[j]) * st.labelFontSize * 0.9) + 6;
+            int anchor = m_lAnchor[j];
+            // text above the anchor point prefers to move up, text below prefers down
+            int pref = (anchor == ANCHOR_LEFT_LOWER || anchor == ANCHOR_RIGHT_LOWER || anchor == ANCHOR_LOWER) ? -1 : +1;
+            int best = 0;
+            bool found = false;
+            int a1 = 0, b1 = 0, a2 = 0, b2 = 0;
+            for(int t = 0; t < 11 && !found; t++)
+              {
+               int step = (t + 1) / 2;
+               int dy = (t == 0) ? 0 : ((t % 2 == 1) ? pref : -pref) * step * lh;
+               LabelRect(x, y + dy, w, lh, anchor, a1, b1, a2, b2);
+               bool hit = false;
+               for(int q = 0; q < placed && !hit; q++)
+                  if(a1 < rx2[q] && a2 > rx1[q] && b1 < ry2[q] && b2 > ry1[q])
+                     hit = true;
+               if(!hit)
+                 {
+                  best = dy;
+                  found = true;
+                 }
+              }
+            if(!found)
+              {
+               // no free slot nearby: low-priority text is dropped, important text stays put
+               if(m_lPrio[j] < DLS_PRIO_LEVEL)
+                  visible = false;
+               else
+                  LabelRect(x, y, w, lh, anchor, a1, b1, a2, b2);
+              }
+            if(visible)
+              {
+               rx1[placed] = a1; ry1[placed] = b1; rx2[placed] = a2; ry2[placed] = b2;
+               placed++;
+               if(best != 0)
+                 {
+                  datetime tt;
+                  double pp;
+                  int sw;
+                  if(ChartXYToTimePrice(m_chart, x, y + best, sw, tt, pp) && sw == 0)
+                     price = pp;
+                 }
+              }
+           }
+         string nm = m_lName[j];
+         if(!visible)
+           {
+            ObjectDelete(m_chart, nm);
+            continue;
+           }
+         if(ObjectFind(m_chart, nm) < 0)
+           {
+            ObjectCreate(m_chart, nm, OBJ_TEXT, 0, m_lTime[j], price);
+            ObjectSetInteger(m_chart, nm, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(m_chart, nm, OBJPROP_HIDDEN, true);
+            ObjectSetString(m_chart, nm, OBJPROP_FONT, "Arial");
+           }
+         ObjectSetInteger(m_chart, nm, OBJPROP_TIME, 0, m_lTime[j]);
+         ObjectSetDouble(m_chart, nm, OBJPROP_PRICE, 0, price);
+         ObjectSetString(m_chart, nm, OBJPROP_TEXT, m_lText[j]);
+         ObjectSetInteger(m_chart, nm, OBJPROP_COLOR, m_lClr[j]);
+         ObjectSetInteger(m_chart, nm, OBJPROP_FONTSIZE, st.labelFontSize);
+         ObjectSetInteger(m_chart, nm, OBJPROP_ANCHOR, m_lAnchor[j]);
+        }
+     }
 
    //+---------------------------------------------------------------+
    //| Chart story of one day                                          |
    //+---------------------------------------------------------------+
-   void              DrawDay(CDlsEngine &eng, const int i)
+   void              DrawDay(CDlsEngine &eng, const int i, const bool withLabels = true)
      {
       if(i < 0 || i >= eng.dayCount)
          return;
       SDlsDay d = eng.days[i];
       string p = m_pfx + IntegerToString(d.dayKey) + "_";
+      ClearLabels(p);                 // labels are rebuilt for this day
+      m_dayLabels = withLabels;
       datetime cutT = eng.TimeOfStoryMinute(d.dayKey, eng.NyCutoffSm());
       datetime lineEnd = d.lastBarTime + eng.periodSec;
       if(cutT > lineEnd) lineEnd = cutT;
@@ -61,7 +210,7 @@ public:
             cap += "  " + DlsRangeClassText(d.asiaClass) + (d.asiaRefAtr > 0 ? StringFormat(" %.2f ATR", d.asiaRatio) : "");
          else
             cap += "  BUILDING";
-         Txt(p + "ASIA_CAP", d.asiaStartTime, d.asiaHigh, cap, st.textColor, ANCHOR_LEFT_LOWER);
+         Txt(p + "ASIA_CAP", d.asiaStartTime, d.asiaHigh, cap, st.textColor, ANCHOR_LEFT_LOWER, DLS_PRIO_BOX);
         }
       // ---- LONDON box
       if(d.lonStarted)
@@ -72,7 +221,7 @@ public:
             cap += "  " + DlsLondonResultText(d.londonStory);
          else
             cap += "  BUILDING";
-         Txt(p + "LON_CAP", d.lonStartTime, d.lonHigh, cap, st.textColor, ANCHOR_LEFT_LOWER);
+         Txt(p + "LON_CAP", d.lonStartTime, d.lonHigh, cap, st.textColor, ANCHOR_LEFT_LOWER, DLS_PRIO_BOX);
         }
 
       // ---- liquidity levels
@@ -97,8 +246,13 @@ public:
          if(d.lv[k].status == DLS_LVS_ACCEPTED ||
             d.lv[k].status == DLS_LVS_PENDING)         ls = STYLE_DOT;
          Seg(p + "LV" + IntegerToString(k), t1, d.lv[k].price, t2, d.lv[k].price, c, ls, 1);
-         Txt(p + "LVT" + IntegerToString(k), t1, d.lv[k].price, LevelCaption(d.lv[k], k),
-             c, d.lv[k].isHigh ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+         // caption sits at the END of the line (where it was taken, or still open),
+         // away from the session box captions at the start
+         bool core = (k == DLS_LV_ASIA_HIGH || k == DLS_LV_ASIA_LOW || k == DLS_LV_LONDON_HIGH || k == DLS_LV_LONDON_LOW);
+         if(st.labelMode != DLS_LABELS_MINIMAL || core)
+            Txt(p + "LVT" + IntegerToString(k), t2, d.lv[k].price, LevelCaption(d.lv[k], k),
+                c, d.lv[k].isHigh ? ANCHOR_RIGHT_LOWER : ANCHOR_RIGHT_UPPER,
+                d.lv[k].nyTarget ? DLS_PRIO_TARGET : DLS_PRIO_LEVEL);
         }
 
       // ---- normal FVGs (context only)
@@ -260,21 +414,63 @@ private:
       ObjectSetInteger(m_chart, name, OBJPROP_WIDTH, w);
      }
 
-   void              Txt(const string name, const datetime t, const double price, const string text, const color c, const ENUM_ANCHOR_POINT anchor)
+   //--- register a text label; objects are created by Layout()
+   void              Txt(const string name, const datetime t, const double price, const string text, const color c, const ENUM_ANCHOR_POINT anchor, const int prio)
      {
-      if(ObjectFind(m_chart, name) < 0)
+      if(!m_dayLabels && prio < DLS_PRIO_BOX)
+         return;
+      int j = -1;
+      for(int q = 0; q < m_lN; q++)
+         if(m_lName[q] == name) { j = q; break; }
+      if(j < 0)
         {
-         ObjectCreate(m_chart, name, OBJ_TEXT, 0, t, price);
-         ObjectSetInteger(m_chart, name, OBJPROP_SELECTABLE, false);
-         ObjectSetInteger(m_chart, name, OBJPROP_HIDDEN, true);
-         ObjectSetString(m_chart, name, OBJPROP_FONT, "Arial");
+         j = m_lN++;
+         ArrayResize(m_lName, m_lN, 64); ArrayResize(m_lTime, m_lN, 64); ArrayResize(m_lPrice, m_lN, 64);
+         ArrayResize(m_lText, m_lN, 64); ArrayResize(m_lClr, m_lN, 64); ArrayResize(m_lAnchor, m_lN, 64);
+         ArrayResize(m_lPrio, m_lN, 64);
+         m_lName[j] = name;
         }
-      ObjectSetInteger(m_chart, name, OBJPROP_TIME, 0, t);
-      ObjectSetDouble(m_chart, name, OBJPROP_PRICE, 0, price);
-      ObjectSetString(m_chart, name, OBJPROP_TEXT, text);
-      ObjectSetInteger(m_chart, name, OBJPROP_COLOR, c);
-      ObjectSetInteger(m_chart, name, OBJPROP_FONTSIZE, st.labelFontSize);
-      ObjectSetInteger(m_chart, name, OBJPROP_ANCHOR, anchor);
+      m_lTime[j] = t;
+      m_lPrice[j] = price;
+      m_lText[j] = text;
+      m_lClr[j] = c;
+      m_lAnchor[j] = anchor;
+      m_lPrio[j] = prio;
+     }
+
+   //--- drop registered labels (and their objects) whose name starts with prefix
+   void              ClearLabels(const string prefix)
+     {
+      int w = 0;
+      int len = StringLen(prefix);
+      for(int q = 0; q < m_lN; q++)
+        {
+         if(StringSubstr(m_lName[q], 0, len) == prefix)
+           {
+            ObjectDelete(m_chart, m_lName[q]);
+            continue;
+           }
+         if(w != q)
+           {
+            m_lName[w] = m_lName[q]; m_lTime[w] = m_lTime[q]; m_lPrice[w] = m_lPrice[q];
+            m_lText[w] = m_lText[q]; m_lClr[w] = m_lClr[q]; m_lAnchor[w] = m_lAnchor[q]; m_lPrio[w] = m_lPrio[q];
+           }
+         w++;
+        }
+      m_lN = w;
+     }
+
+   //--- pixel box of a label for a given anchor
+   void              LabelRect(const int x, const int y, const int w, const int h, const int anchor, int &x1, int &y1, int &x2, int &y2) const
+     {
+      bool left = (anchor == ANCHOR_LEFT_UPPER || anchor == ANCHOR_LEFT || anchor == ANCHOR_LEFT_LOWER);
+      bool right = (anchor == ANCHOR_RIGHT_UPPER || anchor == ANCHOR_RIGHT || anchor == ANCHOR_RIGHT_LOWER);
+      x1 = left ? x : (right ? x - w : x - w / 2);
+      x2 = x1 + w;
+      bool top = (anchor == ANCHOR_LEFT_UPPER || anchor == ANCHOR_RIGHT_UPPER || anchor == ANCHOR_UPPER);
+      bool bottom = (anchor == ANCHOR_LEFT_LOWER || anchor == ANCHOR_RIGHT_LOWER || anchor == ANCHOR_LOWER);
+      y1 = top ? y : (bottom ? y - h : y - h / 2);
+      y2 = y1 + h;
      }
 
    void              Arrow(const string name, const datetime t, const double price, const int code, const color c, const bool above)
@@ -308,8 +504,22 @@ private:
      {
       string s = DlsLiquidityName(k) + " " + Px(v.price);
       if(v.status == DLS_LVS_ACTIVE)
-         return s + "  ACTIVE";
-      return s + "  " + DlsLevelStatusText(v.status) + " (" + DlsSessionText(v.takenBy) + ")";
+         return s + " [ACTIVE]";
+      if(st.labelMode == DLS_LABELS_FULL)
+         return s + " [" + DlsLevelStatusText(v.status) + " - " + DlsSessionText(v.takenBy) + "]";
+      return s + " [" + ShortStatus(v.status) + " " + DlsSessionText(v.takenBy) + "]";
+     }
+
+   string            ShortStatus(const int stt) const
+     {
+      switch(stt)
+        {
+         case DLS_LVS_WICK_SWEPT: return "SWEPT";
+         case DLS_LVS_RECLAIMED:  return "RECLAIMED";
+         case DLS_LVS_PENDING:    return "TRADED";
+         case DLS_LVS_ACCEPTED:   return "BROKEN";
+        }
+      return "ACTIVE";
      }
 
    string            LvPanel(const SDlsLevel &v) const
@@ -548,55 +758,71 @@ private:
       string nm = p + "EV" + IntegerToString(e);
       bool high = (ev.levelKind == DLS_LV_ASIA_HIGH || ev.levelKind == DLS_LV_LONDON_HIGH ||
                    ev.levelKind == DLS_LV_PDH || ev.levelKind == DLS_LV_SWING_HIGH);
+      bool full = (st.labelMode == DLS_LABELS_FULL);
       string liq = DlsLiquidityName(ev.levelKind);
+      string arrow = (ev.dir < 0) ? DlsArrowD() : DlsArrowU();
+      // events of the committed story outrank events of failed legs
+      bool inStory = d.committed && ev.time >= d.story.sweepTime;
+      int prio = inStory ? DLS_PRIO_STORY : DLS_PRIO_EVENT;
       switch(ev.type)
         {
          case DLS_EV_LEVEL_TAKEN:
+         case DLS_EV_LEVEL_RECLAIMED:
+         case DLS_EV_LEVEL_ACCEPTED:
            {
-            if(ev.session == DLS_SES_NY && d.lv[ev.levelKind].nyTarget)
+            if(ev.type == DLS_EV_LEVEL_TAKEN && ev.session == DLS_SES_NY && d.lv[ev.levelKind].nyTarget)
                return;   // NY targets get the NY SWEEP label instead
-            string what = (ev.detail == DLS_LVS_WICK_SWEPT) ? "SWEEP" : (ev.detail == DLS_LVS_ACCEPTED ? "BREAK" : "RAID");
-            Txt(nm, ev.time, ev.price, liq + " " + what + " - " + DlsSessionText(ev.session), LevelColor(ev.levelKind),
-                high ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+            // the level caption already carries the status: compact modes only mark the spot
+            Arrow(nm + "A", ev.time, ev.price, 159, LevelColor(ev.levelKind), high);
+            if(!full)
+               return;
+            string what = "BROKEN / ACCEPTED";
+            if(ev.type == DLS_EV_LEVEL_RECLAIMED)
+               what = "RECLAIMED";
+            else if(ev.type == DLS_EV_LEVEL_TAKEN)
+               what = (ev.detail == DLS_LVS_WICK_SWEPT) ? "SWEEP - " + DlsSessionText(ev.session) :
+                      (ev.detail == DLS_LVS_ACCEPTED ? "BREAK - " + DlsSessionText(ev.session) : "RAID - " + DlsSessionText(ev.session));
+            Txt(nm, ev.time, ev.price, liq + " " + what, LevelColor(ev.levelKind),
+                high ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER, DLS_PRIO_EVENT);
             break;
            }
-         case DLS_EV_LEVEL_RECLAIMED:
-            Txt(nm, ev.time, ev.price, liq + " RECLAIMED", LevelColor(ev.levelKind), high ? ANCHOR_LEFT_UPPER : ANCHOR_LEFT_LOWER);
-            break;
-         case DLS_EV_LEVEL_ACCEPTED:
-            Txt(nm, ev.time, ev.price, liq + " BROKEN / ACCEPTED", LevelColor(ev.levelKind), high ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
-            break;
          case DLS_EV_NY_SWEEP:
             Arrow(nm + "A", ev.time, ev.price, high ? 234 : 233, DirColor(ev.dir), high);
-            Txt(nm, ev.time, ev.price, "NY SWEEP " + liq, DirColor(ev.dir), high ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+            Txt(nm, ev.time, ev.price, "NY SWEEP " + liq, DirColor(ev.dir), high ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER,
+                inStory ? DLS_PRIO_STORY : DLS_PRIO_TARGET);
             break;
          case DLS_EV_BOTH_SIDES:
-            Txt(nm, ev.time, ev.price, "BOTH SIDES TAKEN - WAIT FOR STRUCTURE", st.neutralColor, ANCHOR_LEFT_UPPER);
+            Txt(nm, ev.time, ev.price, full ? "BOTH SIDES TAKEN - WAIT FOR STRUCTURE" : "BOTH SIDES TAKEN",
+                st.neutralColor, ANCHOR_LEFT_UPPER, DLS_PRIO_TARGET);
             break;
          case DLS_EV_DISPLACEMENT:
-            Txt(nm, ev.time, ev.price, (ev.dir < 0 ? "Bearish" : "Bullish") + string(" Displacement"), DirColor(ev.dir),
-                ev.dir < 0 ? ANCHOR_RIGHT_UPPER : ANCHOR_RIGHT_LOWER);
+            if(!inStory && st.labelMode == DLS_LABELS_MINIMAL)
+               return;
+            Txt(nm, ev.time, ev.price, full ? (ev.dir < 0 ? "Bearish" : "Bullish") + string(" Displacement") : "DISP " + arrow,
+                DirColor(ev.dir), ev.dir < 0 ? ANCHOR_RIGHT_UPPER : ANCHOR_RIGHT_LOWER, prio);
             break;
          case DLS_EV_MSS:
-            Txt(nm, ev.time, ev.price, "MSS " + (ev.dir < 0 ? DlsArrowD() : DlsArrowU()), DirColor(ev.dir),
-                ev.dir < 0 ? ANCHOR_LEFT_UPPER : ANCHOR_LEFT_LOWER);
+            Txt(nm, ev.time, ev.price, "MSS " + arrow, DirColor(ev.dir), ev.dir < 0 ? ANCHOR_LEFT_UPPER : ANCHOR_LEFT_LOWER, DLS_PRIO_STORY);
             break;
          case DLS_EV_STORY_FVG:
-            Txt(nm, ev.time, ev.price, "STORY FVG" + ((d.sbFvg || d.sbMss) ? "  [SILVER BULLET]" : ""), DirColor(ev.dir), ANCHOR_RIGHT);
+            Txt(nm, ev.time, ev.price, "STORY FVG" + ((d.sbFvg || d.sbMss) ? (full ? "  [SILVER BULLET]" : " [SB]") : ""),
+                DirColor(ev.dir), ANCHOR_RIGHT, DLS_PRIO_STORY);
             break;
          case DLS_EV_RETRACE:
             Arrow(nm + "A", ev.time, ev.price, 159, DirColor(ev.dir), ev.dir < 0);
-            Txt(nm, ev.time, ev.price, "RETRACE", DirColor(ev.dir), ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+            Txt(nm, ev.time, ev.price, "RETRACE", DirColor(ev.dir), ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER, DLS_PRIO_STORY);
             break;
          case DLS_EV_LEG_FAILED:
-            Txt(nm, ev.time, ev.price, "NO REVERSAL CONFIRMATION (" + DlsFailText(ev.detail) + ")", st.neutralColor,
-                ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+            if(st.labelMode == DLS_LABELS_MINIMAL)
+               return;
+            Txt(nm, ev.time, ev.price, (full ? "NO REVERSAL CONFIRMATION (" : "NO REVERSAL (") + DlsFailText(ev.detail) + ")",
+                st.neutralColor, ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER, DLS_PRIO_EVENT);
             break;
          case DLS_EV_INVALIDATED:
-            Txt(nm, ev.time, ev.price, "STORY INVALIDATED", st.neutralColor, ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+            Txt(nm, ev.time, ev.price, "STORY INVALIDATED", st.neutralColor, ev.dir < 0 ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER, DLS_PRIO_STORY);
             break;
          case DLS_EV_STORY_STALLED:
-            Txt(nm, ev.time, ev.price, ev.detail == DLS_ST_NO_FVG ? "NO STORY FVG" : "NO RETRACE", st.neutralColor, ANCHOR_LEFT);
+            Txt(nm, ev.time, ev.price, ev.detail == DLS_ST_NO_FVG ? "NO STORY FVG" : "NO RETRACE", st.neutralColor, ANCHOR_LEFT, DLS_PRIO_STORY);
             break;
         }
      }
